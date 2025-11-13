@@ -5,12 +5,14 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_openai import ChatOpenAI
 from src.vectorstore import VectorDB
+from src.utils import extract_keywords
+from src.context_rules import validate_dropdown
 
-import yaml
 
 class RAGChain:
     """
-    Encapsulates the complete RAG logic, from retrieval to generation.
+    Encapsulates the complete RAG logic, from retrieval to generation,
+    now extended with contextual dropdown-based filtering.
     """
     def __init__(self, chat_memory_history):
         """
@@ -28,43 +30,91 @@ class RAGChain:
             prompts_config = yaml.safe_load(f)
 
         # 2. Initialize components
-        vector_db = VectorDB()
-        self.retriever = vector_db.as_retriever()
+        self.vector_db = VectorDB()
+        self.retriever = self.vector_db.as_retriever()
         self.chat_memory = chat_memory_history
         
-        llm = ChatOpenAI(
+        # LLM setup
+        self.llm = ChatOpenAI(
             model=config['llm']['model_name'],
             temperature=config['llm']['temperature']
         )
 
         # 3. Define the prompt template
         # This prompt uses the system message from config and structures the inputs.
-        qa_prompt = ChatPromptTemplate.from_messages([
+        self.qa_prompt = ChatPromptTemplate.from_messages([
             #("system", config['llm']['system_prompt']),
             ("system", prompts_config['rag_analyst_prompt']),
             ("system", prompts_config['copywriting_generator_prompt']),
             MessagesPlaceholder(variable_name="chat_history"),
-            ("human", "{input}"),
+            ("human", "{final_prompt}"),
         ])
 
         # 4. Construct the main RAG chain
-        rag_chain_from_docs = (
-            RunnablePassthrough.assign(
-                context=(lambda x: self.format_docs(x["context"]))
-            )
-            | qa_prompt
-            | llm
-            | StrOutputParser()
-        )
-        
         self.chain_with_history = RunnableWithMessageHistory(
             RunnablePassthrough.assign(
-                context=self.contextualized_question | self.retriever
-            ) | rag_chain_from_docs,
+                context=lambda x: self.retriever.invoke(x["final_prompt"])
+                #context=self.contextualized_question | self.retriever
+            ) | self.qa_prompts | self.llm | StrOutputParser(),
             lambda session_id: self.chat_memory,
-            input_messages_key="input",
-            history_messages_key="chat_history",
+            input_messages_key = "final_prompt",
+            history_messages_key = "chat_history",
         )
+
+
+    # --------------------------------
+    # Contextual Augmentation Section
+    # --------------------------------
+
+    def build_contextual_prompt(self, user_input: str, filters: dict):
+        """
+        Builds a rich RAG prompt that includes:
+        - Dropdown context (industry, objective, target_market)
+        - High-performing retrieved ads (CTR > 0.5)
+        """
+
+        # [1] Retrieved relevants ads from vectorstore
+        results = self.vector_db.query(
+            query=user_input,
+            filters={
+                "industry": filters.get("industry"),
+                "objective": filters.get("campaign_objective"),
+                "ctr": {"$gte": 0.5}
+            },
+            top_k = 5
+        )
+
+        # [2] Format the retrieved context
+        retrieved_context = "\n\n".join([
+            f"- {r['metadata'].get('industry')} | CTR: {r['metadata'].get('ctr')} | Text: {r['metadata'].get('text', '')}"
+            for r in results.get("matches", [])
+        ]) if results else "No similar ads found."
+
+# [][][][][] HIGHLIGHT
+        # [3] Assemble the full final prompt (for injection into LLM)
+        final_prompt = f"""
+User Input:
+{user_input}
+
+System Filters:
+- Industry: {filters.get('industry')}
+- Objective: {filters.get('campaign_objective')}
+- Target Market: {filters.get('target_market')}
+- Performance Threshold: CTR > 0.5
+
+Relevant High-Performing Ads (from INVOKE Dataset):
+{retrieved_context}
+
+Instruction:
+Generate ad ideas, headlines, copywriting, CTAs and all others inspired by these examples.
+Maintain the tone suitable for {filters.get('industry')} industry and optimize for {filters.get('campaign_objective')}.
+        """
+
+        return final_prompt
+
+    # ---------------------------------
+    # Base Methods
+    # ---------------------------------
 
     @staticmethod
     def format_docs(docs):
@@ -92,12 +142,28 @@ class RAGChain:
         contextualize_q_llm = ChatOpenAI(temperature=0)
         return contextualize_q_prompt | contextualize_q_llm | StrOutputParser()
 
-    def run(self, user_input: str):
+    # --------------------------------
+    # Main Entry Point
+    # --------------------------------
+
+    def run(self, user_input: str, filters: dict = None):
         """
-        Invokes the RAG chain with the user's input and manages history.
+        Invokes the RAG chain with the user's input and manages history, and dropdown filters.
         """
-        # A dummy session_id is used because StreamlitChatMessageHistory is managed by its key.
+
+        if filters is None:
+            filters = {}
+
+        # Step 0: Validate dropdown context (detect mismatch)
+        clarification = validate_dropdown(user_input, filters)
+        if clarification:
+            return clarification
+        
+        # Step 1: Construct contextual prompt
+        contextual_prompt = self.build_contextual_prompt(user_input, filters)
+
+        # Step 2L Run full RAG Chain
         return self.chain_with_history.invoke(
-            {"input": user_input},
+            {"final_prompt": contextual_prompt},
             config={"configurable": {"session_id": "default_session"}}
         )

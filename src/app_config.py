@@ -55,15 +55,22 @@ INDUSTRIES = (
     "Property & Real Estate",
 )
 
-AD_FORMATS = (
-    "All",
-    "Image",
-    "Video",
-    "Carousel"
-)
+#
+# AD_FORMATS = (
+#     "All",
+#     "Image",
+#     "Video",
+#     "Carousel"
+# )
 
 COUNTRIES = (
     "All",
     "MY",
     "SG"
+)
+
+ADS_LANGUAGES = (
+    "English",
+    "Malay",
+    "Mandarin"
 )
