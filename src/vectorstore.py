@@ -3,7 +3,7 @@ from dotenv import load_dotenv
 from pinecone import Pinecone, PineconeException
 from langchain_openai import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
-from src.context_rules import DROPDOWN_CONTEXTS
+from src.context_rules import  build_metadata_filters
 
 load_dotenv()
 
@@ -12,6 +12,8 @@ class VectorDB:
     A connector class for a pre-populated Pinecone vector database.
     Supports filtered RAG retrieval (e.g, by industry, campaign, or keyword)
     Its sole purpose is to connect to the index and provide a retriever.
+    -Filtered search via dropdown filters
+    -Image-aware retrieval (image_url + caption stored during ingest)
     """
     def __init__(self, embedding_model: str = "text-embedding-3-small"):
         """
@@ -53,7 +55,7 @@ class VectorDB:
     # ---------------------------------------------------
     # Retrieve Documents
     # ---------------------------------------------------
-    def as_retriever(self, search_kwargs: dict={'k': 5}):
+    def as_retriever(self, search_kwargs: dict={'k': 5}, filters: dict = None):
         """
         Returns the vector store instance configured as a retriever.
         
@@ -64,12 +66,17 @@ class VectorDB:
         Returns:
             A LangChain retriever object.
         """
-        return self.vectorstore.as_retriever(search_kwargs=search_kwargs)
+        pinecone_filters = build_metadata_filters(filters)
+
+        return self.vectorstore.as_retriever(
+            search_kwargs={**search_kwargs, "filters": pinecone_filters}
+            )
     
     # --------------------------------------------------------
     # Direct Query Interface
     # --------------------------------------------------------
-    def query(self, query_text: str, top_k: int=5, filters: dict=None):
+    #def query(self, query_text: str, top_k: int=5, filters: dict=None):
+    def query(self, query_text: str, top_k: int = 5, filters: dict = None, min_score: float = 0.0):
 
         """
         Query Pinecone directly for raw vector matches (bypasses LangChain retriever).
@@ -82,70 +89,86 @@ class VectorDB:
         Returns:
             List of matched documents with metadata.
         """
-        if filters is None:
-            filters = {}
-
-        # Build Pinecone-compatible metadata filter
-        metadata_filter = {}
-
-        # Apply industry filter
-        if filters.get("industry") and filters["industry"] != "All":
-            metadata_filter["industry"] = {"$eq": filters["industry"]}
-
-        # Apply campaign objective filter
-        if filters.get("campaign_objective") and filters["campaign_objective"] != "All":
-            metadata_filter["campaign_objective"] = {"$eq": filters["campaign_objective"]}
-
-        # Apply ads language filter
-        if filters.get("ads_language") and filters["ads_language"] != "All":
-            metadata_filter["ads_language"] = {"$eq": filters["ads_language"]}
-        
-        # Optionally add any other dropdown filters from context_rules.py
-        for key in filters:
-            if key not in ["industry", "campaign_objective", "ads_language", "target_market"]:
-                val = filters[key]
-                if val and val != "All":
-                    metadata_filter[key] = {"$eq": val}
-        
+        # Compute query embedding
         try:
-            query_embedding = self.embedding_model.embede_query(query_text)
-            index = self.pc.Index(self.index_name)
-
-            # Perform the query
-            results = index.query(
-                vector=query_embedding,
-                top_k=top_k,
-                include_metadata=True,
-                filter=metadata_filter
-            )
-
-            formatted = [
-                {"id": match["id"], "score": match["score"], "metadata": match["metadata"]}
-                for match in results.get("matches", [])
-            ]
-
-            if not formatted:
-                print(f"⚠️ No matches found for query: '{query_text}' with filters {metadata_filter}")
-            else:
-                print(f"🔍 Retrieved {len(formatted)} matches for '{query_text}' with filters {metadata_filter}")
-
-            return formatted
+            query_embedding = self.embedding_model.embed_query(query_text)
         except Exception as e:
-            print(f"❌ Query failed: {e}")
+            raise RuntimeError(f"Failed to embed query: {e}")
+        
+        index = self.pc.Index(self.index_name)
+
+        # Build Pinecone metadata filter automatically using DROPDOWN_CONTEXTS
+        pinecone_filter = build_metadata_filters(filters)
+        
+        # if filters:
+        #     for key, value in filters.items():
+        #         if value and value != "All":
+        #             pinecone_filter[key] = {"$eq": value}
+        
+        # Perform query
+        try:
+            results = index.query(
+                vector = query_embedding,
+                top_k = top_k,
+                include_metadata=True,
+                filter=pinecone_filter
+            )
+        except Exception as e:
+            print(f"⚠️ Pinecone query failed: {e}")
             return []
-    
+        
+        matches = results.get("matches", [])
+
+        # Format results
+        formatted = []
+        for m in matches:
+            if m["score"] < min_score:
+                continue
+
+            meta = m.get("metadata", {})
+            
+            formatted.append({
+                "id": m["id"],
+                "score": m["score"],
+                "metadata": meta.get("text", ""),
+                "metadata": meta,
+                "image_url": meta.get("image_url"),
+                "caption": meta.get("caption")
+            })
+        
+        print(f"📌 Retrieved {len(formatted)} documents (filters={filters})")
+
+        # formatted = [
+        #     {
+        #         "id": match["id"],
+        #         "score": match["score"],
+        #         "metadata": match["metadata"]
+        #     }
+        #     for match in results.get("matches", [])
+        #     if match["score"] >= min_score
+        # ]
+
+        if not formatted:
+            print(f" No matches found for query: '{query_text}' with filters {filters}")
+        else:
+            print(f" Retrieved {len(formatted)} matches for '{query_text}' with filters {filters}")
+        
+        return formatted
+
     # =====================================================
     # 3. Category-Aware Search Helper
     # =====================================================
-    def query_by_category(self, query_text: str, category: str, top_k: int = 5):
+    def query_by_category(self, query_text: str, category: str, top_k: int = 5, min_score: float = 0.0):
+
         """
         Specialized method to search within a specific dataset category.
 
         Example:
             vectordb.query_by_category("new burger ad ideas", category="burger f&b")
         """
-        filter = {"category": {"$eq": category}}
-        return self.query(query_text=query_text, top_k=top_k, filters=filter)
+        #filter = {"category": {"$eq": category}}
+        #return self.query(query_text=query_text, top_k=top_k, filters=filter)
+        return self.query(query_text, top_k=top_k, filters={"category": category}, min_score=min_score)
     
     # --------------------------------
     # Inspect Stored Data
@@ -165,17 +188,20 @@ class VectorDB:
             index = self.pc.Index(self.index_name)
             stats = index.describe_index_stats()
             
+            total = stats.get("total_vector_count", 0)
+            print(f"Total vectors in '{self.index_name}': {total}")
             #total = stats["total_vector_count"]
             #print(f" Total vectors in '{self.index_name}": {total})
-            print(f"Total vectors in '{self.index_name}': {stats['total_vector_count']}")
+            #print(f"Total vectors in '{self.index_name}': {stats['total_vector_count']}")
             
             if verbose:
-                print("📁 Full index stats:", stats)
-            return stats
+                print("📁 Full index stats:")
+                print(stats)
+            #return stats
 
             # Note: Pinecone doesn't provide direct vector listing
             # So this only prints metadatacounts.
-            #return stats
+            return stats
         
         except Exception as e:
             print(f"⚠️ Failed to get index stats: {e}")

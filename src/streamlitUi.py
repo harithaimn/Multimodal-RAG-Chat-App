@@ -1,195 +1,172 @@
+# ============================================================
+# src/streamlitUi.py
+# ============================================================
+# Streamlit-based UI for Campaign OS
+# - Chat Interface
+# - Sidebar Filters
+# - Session Restoration & Validation
+# ============================================================
+
 import streamlit as st
-from datetime import datetime
-from src.app_config import (
-    CAMPAIGN_OBJECTIVES,
-    TARGET_MARKETS,
-    INDUSTRIES,
-    COUNTRIES
+from src.app_config import get_filter_options
+from src.context_rules import detect_intended_industry, validate_user_input
+from src.utils import (
+    load_chat_history_from_s3,
+    save_chat_history_to_s3,
+    get_s3_key_for_session,
 )
-from src.utils import detect_intended_industry, save_chat_metadata
-from src.context_rules import DROPDOWN_CONTEXTS
+from datetime import datetime
+import uuid
+import json
+
+# ============================================================
+# 1. INITIALIZATION
+# ============================================================
+
+st.set_page_config(page_title="Campaign OS", layout="wide")
+
+if "session_id" not in st.session_state:
+    st.session_state.session_id = str(uuid.uuid4())
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
+
+if "filters" not in st.session_state:
+    st.session_state.filters = {}
 
 
-# ---------------------------
-# SIDEBAR: Chat Session
-# ---------------------------
-def render_sidebar(saved_sessions: list):
-    """
-    Renders the sidebar UI components with chat management features, and returns user actions.
-    
-    Args:
-        saved_sessions (list): A list of saved session dictionaries:
-        {
-            "session_id": str,
-            "title": str,
-            "last_modified": datetime
-        }
-    
-    Returns:
-        str or None: The session_id of a selected chat, or None if no selection is made.
-    """
-    st.title("Chat Conversations")
-        
-    if st.button("➕ New Chat", use_container_width=True):
-        st.session_state.session_id = None # Signal to create a new session
-        st.rerun()
+# ============================================================
+# 2. SIDEBAR FILTERS
+# ============================================================
 
-    st.markdown("---")
-    
-    if not saved_sessions:
-        st.write("No saved conversations yet.")
-        return None
-    
-    st.markdown("### Past Conversations:")
-    
-    for session in saved_sessions:
-        session_id = session['session_id']
-        title = session.get("title") or f"Chat from {session['last_modified'].strftime('%Y-%m-%d %H:%M')}"
-        
-        # Row container
-        cols = st.columns([7, 2, 1])    # [Title, Rename, Open]
-        with cols[0]:
-            st.markdown(f"**{title}**")
-        
-        with cols[1]:
-            if st.button("✏️ Rename", key=f"rename_{session_id}"):
-                new_title = st.text_input(
-                    "Enter new title:",
-                    value=title,
-                    key=f"title_input_{session_id}"
-                )
+st.sidebar.header("🎯 Campaign Filters")
 
-                if st.button("💾 Save", key=f"save_{session_id}"):
-                    session["title"] = new_title.strip() or title
-                    session["last_modified"] = datetime.now()
-                    
-                    save_chat_metadata(session)
+filter_options = get_filter_options()
+selected_filters = {}
 
-                    st.success(f"Renamed to **{session['title']}** ✅")
+for key, options in filter_options.items():
+    selected_filters[key] = st.sidebar.selectbox(
+        f"{key}",
+        options,
+        index=0 if key != "Psychographics" else None,
+        key=f"filter_{key}",
+    )
 
-                    st.rerun()
-            
-        with cols[2]:
-            if st.button("📂 Open", key=f"open_{session_id}"):
-                st.session_state.session_id = session_id
-                st.rerun()
+# Save current filters in session
+st.session_state.filters = selected_filters
 
-# -------------------------------------------------
-# Filters: Campaign Settings & Language Options
-# -------------------------------------------------
-def render_filters() -> dict:
-    """
-    Renders the collapsible filter section and returns the selected filter values.
-    
-    Returns:
-        dict: A dictionary containing the current values of all filters.
-    """
-    st.markdown("## Campaign/Ads Filters")
-    filters = {}
 
-    with st.expander("Campaign Configuration", expanded=True):
-        filters['campaign_objective'] = st.selectbox(
-            "Campaign Objective:",
-            options=CAMPAIGN_OBJECTIVES
-        )
-        filters['target_market'] = st.selectbox(
-            "Target Market:",
-            options=TARGET_MARKETS
-        )
-        filters['industry'] = st.selectbox(
-            "Industry:",
-            options=INDUSTRIES
-        )
-        filters['country'] = st.selectbox(
-            "Target Country:",
-            options=COUNTRIES
-        )
-        filters['ads_language'] = st.selectbox(
-            "Ads Copy Language:",
-            options=("English", "Malay", "Mandarin")
-        )
-        
-    return filters
+# ============================================================
+# 3. SESSION MANAGEMENT
+# ============================================================
 
-# ---------------------------------------------------------
-# Validation: Ensure user input matches selected dropdowns
-# ---------------------------------------------------------
-def validate_user_input(user_text: str, filters: dict):
-    """
-    Check for semantic mismatch between user input and dropdown selections.
-    Shows Streamlit warnings if mismatch is detected.
-    """
+st.sidebar.markdown("---")
+st.sidebar.subheader("💾 Session Management")
 
-    if not user_text.strip():
-        return # Nothing to validate yet
-    
-    text = user_text.lower()
-  
-    #detected_industry = detect_intended_industry(user_text)
-    detected_industry = None
+# Load saved chat history (from S3)
+if st.sidebar.button("🔁 Restore Last Session"):
+    with st.spinner("Restoring previous chat and filters..."):
+        data = load_chat_history_from_s3(st.session_state.session_id)
+        if data:
+            st.session_state.chat_history = data.get("chat_history", [])
+            st.session_state.filters = data.get("filters", selected_filters)
+            st.success("✅ Session restored from S3.")
+        else:
+            st.warning("No previous session found on S3.")
 
-    for industry_name, data in DROPDOWN_CONTEXTS.get("industry", {}).items():
-        keywords = [kw.lower() for kw in data.get("keywords", [])]
-        if any(kw in text for kw in keywords):
-            detected_industry = industry_name
-            break
-        
-    if detected_industry and detected_industry != filters['industry']:
+# Rename session
+new_session_name = st.sidebar.text_input("Rename Session", value="Campaign Chat")
+st.session_state.session_name = new_session_name
+
+
+# ============================================================
+# 4. MAIN CHAT INTERFACE
+# ============================================================
+
+st.title("🧠 Campaign OS Assistant")
+st.caption("AI-powered copywriting, audience insight, and creative ideation engine.")
+
+chat_container = st.container()
+
+# Display chat history
+for msg in st.session_state.chat_history:
+    role = msg["role"]
+    with chat_container.chat_message(role):
+        st.markdown(msg["content"])
+
+# User input field with Shift+Enter multiline support
+user_input = st.chat_input("Type your campaign brief or question here...")
+
+# ============================================================
+# 5. INPUT VALIDATION & CONTEXT CHECK
+# ============================================================
+
+if user_input:
+    # Step 1: Detect industry intent
+    intended_industry = detect_intended_industry(user_input)
+    selected_industry = st.session_state.filters.get("Industry")
+
+    # Step 2: Run validation heuristics
+    validation_issues = validate_user_input(user_input, st.session_state.filters)
+
+    if intended_industry and intended_industry != selected_industry:
         st.warning(
-            f"⚠️ Your text seems related to **{detected_industry}**, "
-            f"but you selected **{filters['industry']}**.\n\n"
-            f"💡 Did you mean to select **{detected_industry}** industry instead?"
+            f"⚠️ Detected intent for **{intended_industry}**, "
+            f"but your filter is set to **{selected_industry}**."
         )
-    
-    # ---------------------------
-    # Campaign objective mismatch (existing logic)
-    # ---------------------------
-    # Awareness
-    if any(x in text for x in ["awareness", "reach", "exposure"]) and filters.get('campaign_objective') != "Brand Awareness":
-        st.info("💡 You mentioned 'awareness' or 'reach' — consider selecting **Brand Awareness** as your objective.")
 
-    # Lead generation
-    if any(x in text for x in ["leads", "signup", "form", "conversion", "customer info"]) and filters.get('campaign_objective') != "Lead Generation":
-        st.info("💡 You mentioned 'leads' or 'signups' — consider selecting **Lead Generation**.")
+    if validation_issues:
+        st.error("⚠️ Input validation failed:")
+        for issue in validation_issues:
+            st.markdown(f"- {issue}")
 
-    # Conversions
-    if any(x in text for x in ["purchase", "buy now", "checkout", "add to cart", "sales"]) and filters.get('campaign_objective') != "Conversions":
-        st.info("💡 You mentioned 'purchase' or 'sales' — consider selecting **Conversions**.")
+    # Step 3: Append user input to chat
+    st.session_state.chat_history.append({"role": "user", "content": user_input})
 
-    # App installs
-    if any(x in text for x in ["install", "download app", "mobile app"]) and filters.get('campaign_objective') != "App Installs":
-        st.info("💡 You mentioned 'install' or 'download app' — consider selecting **App Installs**.")
+    # ============================================================
+    # 6. SIMULATE GENERATION / RESPONSE (placeholder for RAG chain)
+    # ============================================================
+    with chat_container.chat_message("assistant"):
+        with st.spinner("Thinking..."):
+            # Placeholder for your RAG pipeline integration
+            # E.g. response = rag_chain.run(user_input, filters=selected_filters)
+            response = (
+                f"Generated campaign insights for {selected_industry} "
+                f"({selected_filters['Campaign Objective']}) — coming soon!"
+            )
+            st.markdown(response)
 
-    # Video views
-    if any(x in text for x in ["watch", "video", "views"]) and filters.get('campaign_objective') != "Video Views":
-        st.info("💡 You mentioned 'video' — consider selecting **Video Views** as your objective.")
+    st.session_state.chat_history.append({"role": "assistant", "content": response})
 
-    # Engagement
-    if any(x in text for x in ["like", "comment", "share", "interaction", "engagement"]) and filters.get('campaign_objective') != "Post Engagement":
-        st.info("💡 You mentioned engagement-related actions — consider selecting **Post Engagement**.")
+    # ============================================================
+    # 7. SAVE SESSION (Chat + Filters) TO S3
+    # ============================================================
+    session_payload = {
+        "chat_history": st.session_state.chat_history,
+        "filters": st.session_state.filters,
+        "timestamp": datetime.utcnow().isoformat(),
+    }
 
-    # Messages
-    if any(x in text for x in ["dm", "message us", "whatsapp", "inbox"]) and filters.get('campaign_objective') != "Messages":
-        st.info("💡 You mentioned messaging — consider selecting **Messages** objective.")
+    save_chat_history_to_s3(st.session_state.session_id, session_payload)
+    st.toast("💾 Session saved to S3.")
 
-    # Traffic
-    if any(x in text for x in ["link click", "website visit", "traffic"]) and filters.get('campaign_objective') != "Link Clicks":
-        st.info("💡 You mentioned website or traffic — consider selecting **Link Clicks** objective.")
 
-# -------------------------------------------------------------
-# Main Chat Interface
-# -------------------------------------------------------------
-def render_chat_interface(chat_history):
-    """
-    Renders the main chat message display area.
-    """
-    st.title("🤖 Multimodal RAG LLM Chatbot")
-    st.caption("An AI assistant for INVOKE’s Internal Marketing Ideation & Analysis")
-    # st.caption("An AI assistant/ideation for the Inhouse INVOKE's Digital Marketing Team")
-    
-    if not chat_history or not getattr(chat_history, "messages", None):
-        st.info("Start a conversation using the chat input below.")
-        return
-    
-    for msg in chat_history.messages:
-        st.chat_message(msg.type).write(msg.content)
+# ============================================================
+# 8. VISUAL RECOMMENDATIONS / OUTPUT DISPLAY
+# ============================================================
+
+st.markdown("---")
+st.subheader("📊 Top Reference Ad Example")
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.image("https://via.placeholder.com/300x300.png?text=Ad+Thumbnail", use_container_width=True)
+
+with col2:
+    st.metric(label="CTR", value="4.7%", delta="+0.9% MoM")
+    st.metric(label="Engagement Rate", value="6.3%", delta="+1.2% MoM")
+    st.markdown("**Insight:** High-performing creative featuring emotional appeal and local language use.")
+
+st.markdown("---")
+st.caption("💡 Tip: Adjust filters in the sidebar to refine campaign context or audience insights.")
