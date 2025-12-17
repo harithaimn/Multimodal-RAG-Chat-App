@@ -1,137 +1,160 @@
 # src/streamlitUi.py
-
 """
-Streamlit UI for Multimodal RAG (DM Internal Tool)
+Streamlit UI for RAG-powered Ad Generator
 
-Responsibilities:
-- Render sidebar filters
-- Manage chat session state
-- Call RAGChain
-- Render multimodal responses (text + images)
-
-Single public entry:
-- main()
+Principles:
+- Generation-first
+- Explanation-second
+- RAG is invisible to the user
 """
 
 import streamlit as st
-import uuid
+from openai import OpenAI
 
-from src.app_config import get_filter_options
-from src.context_rules import (
-    normalize_filters,
-    validate_user_input_vs_filters
-)
-from src.openai_chain import RAGChain
+from src.vectorstore import init_vectorstore, init_embeddings, retrieve_pattern_docs
+from src.openai_chain import generate_ad_with_patterns
+from src.context_rules import enforce_context_rules
 
+from dotenv import load_dotenv
+import os
 
-# -------------------------------------------------
-# Session Initialization
-# -------------------------------------------------
+load_dotenv()
 
-def _init_session():
-    if "session_id" not in st.session_state:
-        st.session_state.session_id = str(uuid.uuid4())
+# =====================================================
+# Clients (cached)
+# =====================================================
 
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+@st.cache_resource
+def load_clients():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY not found in environment")
 
-    if "filters" not in st.session_state:
-        st.session_state.filters = {}
-
-
-# -------------------------------------------------
-# Sidebar Filters
-# -------------------------------------------------
-
-def _render_sidebar_filters():
-    st.sidebar.header("🎯 Filters")
-
-    filter_options = get_filter_options()
-    raw_filters = {}
-
-    for key, options in filter_options.items():
-        raw_filters[key] = st.sidebar.selectbox(
-            key.replace("_", " ").title(),
-            options,
-            index=0,
-            key=f"filter_{key}"
-        )
-
-    st.session_state.filters = raw_filters
-    return normalize_filters(raw_filters)
+    client = OpenAI(api_key=api_key)
+    index = init_vectorstore()
+    embeddings = init_embeddings()
+    return client, index, embeddings
 
 
-# -------------------------------------------------
-# Chat History Renderer
-# -------------------------------------------------
-
-def _render_chat_history(container):
-    for msg in st.session_state.chat_history:
-        with container.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-
-
-# -------------------------------------------------
-# Assistant Response Renderer
-# -------------------------------------------------
-
-def _render_assistant_response(container, answer, retrieved):
-    with container.chat_message("assistant"):
-        st.markdown(answer)
-
-        # Render first available image (optional)
-        for r in retrieved:
-            img_url = r.get("image_url")
-            if img_url:
-                st.image(img_url, use_container_width=True)
-                break
-
-
-# -------------------------------------------------
-# Main Application Entry
-# -------------------------------------------------
+# =====================================================
+# Page Config
+# =====================================================
 
 def main():
-    _init_session()
-
-    st.title("🧠 Multimodal RAG – Digital Marketing Assistant")
-    st.caption("Dataset-grounded insights powered by Supermetrics + Pinecone")
-
-    # Sidebar
-    filters = _render_sidebar_filters()
-
-    # Main chat container
-    chat_container = st.container()
-    _render_chat_history(chat_container)
-
-    # User input
-    user_input = st.chat_input(
-        "Ask about campaign performance, creatives, or insights..."
+    st.set_page_config(
+        page_title="Ad Generator",
+        layout="centered",
     )
 
-    if not user_input:
-        return
+    st.title("Ad Copy Generator")
+    st.caption("Generate high-conversion ads inspired by historical performance patterns.")
 
-    # Validation (soft warnings only)
-    warnings = validate_user_input_vs_filters(user_input, filters)
-    for w in warnings:
-        st.warning(w)
+    client, index, embeddings = load_clients()
 
-    # Append user message
-    st.session_state.chat_history.append({
-        "role": "user",
-        "content": user_input
-    })
+    # =====================================================
+    # Sidebar Controls
+    # =====================================================
 
-    # Run RAG
-    rag = RAGChain(chat_history=st.session_state.chat_history)
-    answer, retrieved = rag.run(user_input, filters=filters)
+    st.sidebar.header("Ad Settings")
 
-    # Append assistant message
-    st.session_state.chat_history.append({
-        "role": "assistant",
-        "content": answer
-    })
+    business_type = st.sidebar.text_input(
+        "Business type",
+        placeholder="e.g. F&B, Burger Stall",
+    )
 
-    # Render response
-    _render_assistant_response(chat_container, answer, retrieved)
+    product = st.sidebar.text_input(
+        "Product / Offer",
+        placeholder="e.g. Smash burger RM6",
+    )
+
+    platform = st.sidebar.selectbox(
+        "Platform",
+        ["Meta Ads", "Instagram", "Facebook", "TikTok"],
+    )
+
+    language_style = st.sidebar.selectbox(
+        "Language style",
+        [
+            "Casual Malaysian English",
+            "Bahasa Melayu (Santai)",
+            "English (Direct & Punchy)",
+            "Mix BM + English",
+        ],
+    )
+
+    mode = st.sidebar.radio(
+        "Output mode",
+        ["Generate Ad + Explain Why", "Generate Ad Only"],
+    )
+
+    # =====================================================
+    # Main Action
+    # =====================================================
+
+    if st.button("Generate Ad", type="primary"):
+        if not business_type or not product:
+            st.error("Please fill in Business type and Product.")
+            st.stop()
+
+        with st.spinner("Generating ad..."):
+            # -------------------------------------------------
+            # 1. Retrieve pattern signals (RAG)
+            # -------------------------------------------------
+            query = f"{business_type} {product} ad performance"
+            rag_docs = retrieve_pattern_docs(
+                index=index,
+                embeddings=embeddings,
+                query=query,
+            )
+
+            # -------------------------------------------------
+            # 2. Generate output
+            # -------------------------------------------------
+            raw_output = generate_ad_with_patterns(
+                client=client,
+                rag_docs=rag_docs,
+                business_type=business_type,
+                product=product,
+                platform=platform,
+                language_style=language_style,
+            )
+
+            # -------------------------------------------------
+            # 3. Enforce context rules
+            # -------------------------------------------------
+            try:
+                result = enforce_context_rules(
+                    f"""
+[AD COPY]
+{raw_output['ad_copy']}
+
+[WHY THIS WORKS (PATTERN REFERENCE)]
+{raw_output['pattern_explanation']}
+"""
+            )
+            except Exception as e:
+                st.error(f"Output validation failed: {e}")
+                st.stop()
+
+        # =================================================
+        # Output Rendering
+        # =================================================
+
+        st.subheader("Generated Ad Copy")
+        st.text_area(
+            label="",
+            value=result["ad_copy"],
+            height=120,
+        )
+
+        if mode == "Generate Ad + Explain Why":
+            st.subheader("Why This Works")
+            st.markdown(result["why"])
+
+        # =================================================
+        # Debug (optional, collapsed)
+        # =================================================
+
+        with st.expander("Debug (pattern signals)"):
+            for d in rag_docs:
+                st.code(d["text"])

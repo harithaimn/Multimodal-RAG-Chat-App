@@ -1,119 +1,164 @@
-# src/vectorstore.py
+"""
+vectorstore.py
 
+Purpose:
+- Store historical ads for PATTERN retrieval
+- Retrieve short, pattern-relevant snippets
+- Avoid prose worship and brand leakage
+"""
+
+from typing import List, Dict, Any
 import os
-from dotenv import load_dotenv
+
 from pinecone import Pinecone
 from langchain_openai import OpenAIEmbeddings
 
-load_dotenv()
+# ============================================================
+# Config
+# ============================================================
+
+EMBEDDING_MODEL = "text-embedding-3-small"
+TOP_K = 5
+MAX_CHARS_PER_DOC = 300  # hard cap to avoid prose copying
+
+# ============================================================
+# Init
+# ============================================================
+
+def init_vectorstore() -> Pinecone:
+    api_key = os.getenv("PINECONE_API_KEY")
+    index_name = os.getenv("PINECONE_INDEX_NAME")
+
+    if not api_key or not index_name:
+        raise RuntimeError("PINECONE_API_KEY or PINECONE_INDEX_NAME missing")
+
+    pc = Pinecone(api_key=api_key)
+    return pc.Index(index_name)
 
 
-class VectorDB:
+def init_embeddings() -> OpenAIEmbeddings:
+    return OpenAIEmbeddings(model=EMBEDDING_MODEL)
+
+# ============================================================
+# Normalization (VERY IMPORTANT)
+# ============================================================
+
+def normalize_ad_text(text: str) -> str:
     """
-    Minimal Pinecone connector for Multimodal RAG.
+    Normalize ad text so embeddings capture STRUCTURE, not branding.
+    """
+    if not text:
+        return ""
 
-    Responsibilities:
-    - Embed query text
-    - Query Pinecone with optional metadata filters
-    - Return formatted results for RAGChain
+    text = text.strip()
+
+    # Remove URLs
+    text = text.replace("http://", "").replace("https://", "")
+
+    # Remove hashtags
+    text = " ".join(w for w in text.split() if not w.startswith("#"))
+
+    # Hard truncate
+    if len(text) > MAX_CHARS_PER_DOC:
+        text = text[:MAX_CHARS_PER_DOC]
+
+    return text
+
+
+# ============================================================
+# Upsert
+# ============================================================
+
+def upsert_ads(
+    *,
+    index,
+    embeddings: OpenAIEmbeddings,
+    ads: List[Dict[str, Any]],
+) -> None:
+    """
+    Expected ad schema:
+    {
+        "id": str,
+        "text": str,
+        "platform": str,
+        "objective": str,
+        "language": str,
+    }
     """
 
-    def __init__(self, embedding_model: str = None):
-        # --- Env ---
-        self.pinecone_api_key = os.getenv("PINECONE_API_KEY")
-        self.index_name = os.getenv("PINECONE_INDEX_NAME")
+    vectors = []
 
-        if not self.pinecone_api_key or not self.index_name:
-            raise ValueError("PINECONE_API_KEY and PINECONE_INDEX_NAME must be set")
+    for ad in ads:
+        raw_text = ad.get("text", "")
+        clean_text = normalize_ad_text(raw_text)
 
-        # --- Pinecone client ---
-        try:
-            self.pc = Pinecone(api_key=self.pinecone_api_key)
-        except Exception as e:
-            raise ConnectionError(f"Pinecone init failed: {e}")
+        if not clean_text:
+            continue
 
-        # --- Verify index ---
-        existing_indexes = self.pc.list_indexes().names()
-        if self.index_name not in existing_indexes:
-            raise ValueError(
-                f"Pinecone index '{self.index_name}' not found. Run ingest.py first."
-            )
+        vector = embeddings.embed_query(clean_text)
 
-        self.index = self.pc.Index(self.index_name)
+        metadata = {
+            "platform": ad.get("platform", "unknown"),
+            "objective": ad.get("objective", "unknown"),
+            "language": ad.get("language", "unknown"),
+            "length": len(clean_text),
+            "has_emoji": any(ord(c) > 10000 for c in clean_text),
+        }
 
-        # --- Embeddings ---
-        model_name = embedding_model or os.getenv(
-            "EMBEDDING_MODEL", "text-embedding-3-small"
+        vectors.append(
+            {
+                "id": ad["id"],
+                "values": vector,
+                "metadata": metadata,
+            }
         )
-        self.embeddings = OpenAIEmbeddings(model=model_name)
 
-        print(f"✅ Connected to Pinecone index '{self.index_name}'")
+    if vectors:
+        index.upsert(vectors=vectors)
 
-    # --------------------------------------------------
-    # Retriever (callable)
-    # --------------------------------------------------
-    def as_retriever(self, search_kwargs: dict = None):
-        """
-        Returns a simple callable retriever.
 
-        retriever(query, filters, k) -> List[dict]
-        """
-        if search_kwargs is None:
-            search_kwargs = {"k": 5}
+# ============================================================
+# Retrieval
+# ============================================================
 
-        def retriever(
-            query: str,
-            filters: dict = None,
-            k: int = None,
-            min_score: float = 0.0,
-        ):
-            top_k = k or search_kwargs.get("k", 5)
+def retrieve_pattern_docs(
+    *,
+    index,
+    embeddings: OpenAIEmbeddings,
+    query: str,
+    top_k: int = TOP_K,
+) -> List[Dict[str, Any]]:
+    """
+    Retrieve ads as PATTERN SIGNALS, not full examples.
+    """
 
-            # --- Build Pinecone metadata filter ---
-            pinecone_filter = {}
-            if filters:
-                for key, value in filters.items():
-                    if value and value != "All":
-                        pinecone_filter[key] = {"$eq": value}
+    query_embedding = embeddings.embed_query(query)
 
-            # --- Embed query ---
-            query_vec = self.embeddings.embed_query(query)
+    results = index.query(
+        vector=query_embedding,
+        top_k=top_k,
+        include_metadata=True,
+    )
 
-            # --- Query Pinecone ---
-            results = self.index.query(
-                vector=query_vec,
-                top_k=top_k,
-                include_metadata=True,
-                filter=pinecone_filter or None,
-            )
+    docs = []
 
-            matches = results.get("matches", [])
+    for match in results.get("matches", []):
+        meta = match.get("metadata", {})
 
-            # --- Format output ---
-            formatted = []
-            for m in matches:
-                if m["score"] < min_score:
-                    continue
+        # Construct a pattern-oriented text summary
+        pattern_text = (
+            f"Platform: {meta.get('platform')} | "
+            f"Objective: {meta.get('objective')} | "
+            f"Length: {meta.get('length')} | "
+            f"Emoji: {meta.get('has_emoji')}"
+        )
 
-                meta = m.get("metadata", {}) or {}
+        docs.append(
+            {
+                "text": pattern_text,
+                "metadata": meta,
+                "score": match.get("score"),
+            }
+        )
 
-                formatted.append(
-                    {
-                        "id": m.get("id"),
-                        "score": m.get("score"),
-                        "metadata": meta,
-                        "image_url": meta.get("image_url"),
-                        "caption": meta.get("caption"),
-                    }
-                )
-
-            return formatted
-
-        return retriever
-
-    # --------------------------------------------------
-    # Direct query helper
-    # --------------------------------------------------
-    def query(self, query: str, filters: dict = None, k: int = 5):
-        retriever = self.as_retriever({"k": k})
-        return retriever(query, filters=filters, k=k)
+    return docs

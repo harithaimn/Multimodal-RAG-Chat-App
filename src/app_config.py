@@ -18,19 +18,19 @@ CAMPAIGN_OBJECTIVES = (
     "Lead Generation",
 )
 
-CAMPAIGN_STATUSES = (
-    "All",
-    "Active",
-    "Paused",
-    "Deleted",
-)
+# CAMPAIGN_STATUSES = (
+#     "All",
+#     "Active",
+#     "Paused",
+#     "Deleted",
+# )
 
-AD_STATUSES = (
-    "All",
-    "Active",
-    "Paused",
-    "Deleted",
-)
+# AD_STATUSES = (
+#     "All",
+#     "Active",
+#     "Paused",
+#     "Deleted",
+# )
 
 
 # -----------------------------
@@ -58,7 +58,7 @@ def get_filter_options():
     """
     return {
         "campaign_objective": CAMPAIGN_OBJECTIVES,
-        "campaign_status": CAMPAIGN_STATUSES,
-        "ad_status": AD_STATUSES,
+        #"campaign_status": CAMPAIGN_STATUSES,
+        #"ad_status": AD_STATUSES,
         "language": ADS_RESPONSE_LANGUAGE,
     }

@@ -1,122 +1,173 @@
-# src/context_rules.py
 """
-Lightweight context & filter utilities for Multimodal RAG (POC).
+context_rules.py
 
-Design principles:
-- Dataset-first (no hallucinated attributes)
-- Optional usage (safe to bypass)
-- Pinecone-compatible filters
-- Future extensibility (industry, psychographics later)
+Purpose:
+- Enforce behavioral rules on LLM output
+- Prevent summarization, dataset worship, and leakage
+- Keep generation aligned with product intent
+
+This file is MODEL-AGNOSTIC.
+It operates on OUTPUT, not PROMPTS.
 """
 
-from typing import Dict, Any, List, Optional
+import re
+from typing import Dict, List
 
+# =====================================================
+# Section Headers (STRICT)
+# =====================================================
 
-# -------------------------------------------------
-# 1. Allowed filter keys (must exist in Pinecone metadata)
-# -------------------------------------------------
+SECTION_AD_COPY = "[AD COPY]"
+SECTION_WHY = "[WHY THIS WORKS"
 
-ALLOWED_FILTER_KEYS = {
-    "campaign_id",
-    "campaign_name",
-    "campaign_objective",
-    "ad_id",
-    "ad_name",
-    "date",
-}
+REQUIRED_SECTIONS = [
+    SECTION_AD_COPY,
+    SECTION_WHY,
+]
 
+# =====================================================
+# Forbidden Phrases
+# =====================================================
 
-# -------------------------------------------------
-# 2. Normalize filters from Streamlit / UI
-# -------------------------------------------------
+FORBIDDEN_IN_AD_COPY = [
+    "dataset",
+    "data shows",
+    "based on",
+    "according to",
+    "retrieved",
+    "historical",
+    "campaign",
+    "example",
+    "insight",
+]
 
-def normalize_filters(raw_filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+FORBIDDEN_GLOBAL = [
+    "as an ai",
+    "i cannot",
+    "i'm unable",
+    "i don't know",
+]
+
+# =====================================================
+# Heuristic Limits
+# =====================================================
+
+MAX_AD_LINES = 6
+MAX_AD_CHARS = 300
+MIN_AD_CHARS = 20
+
+MAX_WHY_LINES = 6
+
+# =====================================================
+# Core Validators
+# =====================================================
+
+def validate_output_structure(text: str) -> None:
     """
-    Cleans UI-provided filters:
-    - Drops empty / 'All' values
-    - Keeps only allowed metadata keys
+    Ensure required sections exist.
     """
-    if not raw_filters:
-        return {}
-
-    normalized = {}
-    for k, v in raw_filters.items():
-        if not v:
-            continue
-        if isinstance(v, str) and v.lower() == "all":
-            continue
-        if k not in ALLOWED_FILTER_KEYS:
-            continue
-        normalized[k] = v
-
-    return normalized
+    for section in REQUIRED_SECTIONS:
+        if section.lower() not in text.lower():
+            raise ValueError(f"Missing required section: {section}")
 
 
-# -------------------------------------------------
-# 3. Build Pinecone metadata filter
-# -------------------------------------------------
-
-def build_pinecone_filter(filters: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+def split_sections(text: str) -> Dict[str, str]:
     """
-    Converts normalized filters into Pinecone-compatible filter syntax.
+    Extract ad copy and explanation sections.
     """
-    normalized = normalize_filters(filters)
+    ad_match = re.search(
+        r"\[AD COPY\](.*?)(\[WHY THIS WORKS.*?\])",
+        text,
+        re.S | re.I,
+    )
 
-    pinecone_filter = {}
-    for k, v in normalized.items():
-        pinecone_filter[k] = {"$eq": v}
+    why_match = re.search(
+        r"\[WHY THIS WORKS.*?\](.*)",
+        text,
+        re.S | re.I,
+    )
 
-    return pinecone_filter
+    if not ad_match or not why_match:
+        raise ValueError("Unable to split output into required sections")
+
+    return {
+        "ad_copy": ad_match.group(1).strip(),
+        "why": why_match.group(1).strip(),
+    }
 
 
-# -------------------------------------------------
-# 4. Optional: lightweight sanity checks
-# -------------------------------------------------
-
-def validate_user_input_vs_filters(
-    user_input: str,
-    filters: Optional[Dict[str, Any]]
-) -> List[str]:
+def validate_ad_copy(ad_text: str) -> None:
     """
-    Soft warnings only.
-    Never blocks execution.
+    Enforce ad-copy-specific constraints.
     """
-    warnings = []
+    lowered = ad_text.lower()
 
-    if not user_input or not filters:
-        return warnings
+    for phrase in FORBIDDEN_IN_AD_COPY:
+        if phrase in lowered:
+            raise ValueError(f"Forbidden phrase in ad copy: '{phrase}'")
 
-    text = user_input.lower()
+    if any(p in lowered for p in FORBIDDEN_GLOBAL):
+        raise ValueError("System / refusal language detected in ad copy")
 
-    # Example: objective mismatch hint
-    objective = filters.get("campaign_objective")
-    if objective:
-        if objective.lower() not in text:
-            warnings.append(
-                f"User input does not explicitly reference campaign objective '{objective}'."
-            )
+    lines = ad_text.splitlines()
 
-    return warnings
+    if len(lines) > MAX_AD_LINES:
+        raise ValueError("Ad copy too long (line limit exceeded)")
+
+    if len(ad_text) > MAX_AD_CHARS:
+        raise ValueError("Ad copy too long (char limit exceeded)")
+
+    if len(ad_text) < MIN_AD_CHARS:
+        raise ValueError("Ad copy too short / low signal")
 
 
-# -------------------------------------------------
-# 5. Derived context (dataset-only, safe)
-# -------------------------------------------------
-
-def derive_context_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+def validate_why_section(why_text: str) -> None:
     """
-    Creates secondary signals strictly from dataset fields.
-    Safe for POC.
+    Validate pattern explanation section.
     """
-    context = {}
+    lines = [l for l in why_text.splitlines() if l.strip()]
 
-    ctr = metadata.get("ctr")
-    if isinstance(ctr, (int, float)):
-        if ctr >= 2.0:
-            context["performance_bucket"] = "high_ctr"
-        elif ctr >= 1.0:
-            context["performance_bucket"] = "medium_ctr"
-        else:
-            context["performance_bucket"] = "low_ctr"
+    if len(lines) > MAX_WHY_LINES:
+        raise ValueError("Too many explanation bullets")
 
-    return context
+    # Encourage pattern language
+    allowed_keywords = [
+        "hook",
+        "length",
+        "emoji",
+        "structure",
+        "tone",
+        "offer",
+        "visual",
+        "cta",
+        "timing",
+    ]
+
+    if not any(k in why_text.lower() for k in allowed_keywords):
+        raise ValueError(
+            "Pattern explanation too vague (no pattern keywords found)"
+        )
+
+
+# =====================================================
+# Public Entry Point
+# =====================================================
+
+def enforce_context_rules(output_text: str) -> Dict[str, str]:
+    """
+    Master enforcement function.
+
+    Returns structured output if valid:
+    {
+        "ad_copy": "...",
+        "why": "..."
+    }
+    """
+    validate_output_structure(output_text)
+
+    sections = split_sections(output_text)
+
+    validate_ad_copy(sections["ad_copy"])
+    validate_why_section(sections["why"])
+
+    return sections

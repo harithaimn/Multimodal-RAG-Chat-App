@@ -1,175 +1,194 @@
-# src/openai_chain.py
-
 """
-Multimodal RAG pipeline (POC-ready)
+openai_chain.py
 
-Responsibilities:
-- Retrieve relevant ads from Pinecone
-- Build dataset-grounded prompt
-- Inject image URLs as multimodal context
-- Call OpenAI chat model for final generation
+Generation-first, explanation-second chain.
 
-Design:
-- No LangChain memory abstractions
-- No inferred attributes
-- Dataset-first grounding only
-"""
+Output format (STRICT):
 
-import yaml
-from typing import Dict, List
+[AD COPY]
+<new ad>
 
-from langchain_openai import ChatOpenAI
-from langchain_core.messages import HumanMessage, SystemMessage
+[WHY THIS WORKS (PATTERN REFERENCE)]
+- <pattern explanation>
+- <pattern explanation>
 
-from src.vectorstore import VectorDB
-
-
-# -------------------------------------------------
-# Load configuration
-# -------------------------------------------------
-
-with open("config/config.yaml", "r") as f:
-    CONFIG = yaml.safe_load(f)
-
-with open("config/prompts.yaml", "r") as f:
-    PROMPTS = yaml.safe_load(f)
-
-LLM_MODEL = CONFIG["llm"]["model_name"]
-LLM_TEMP = CONFIG["llm"]["temperature"]
-EMBEDDING_MODEL = CONFIG["embedding_model"]["model_name"]
-
-
-# -------------------------------------------------
-# RAG Chain
-# -------------------------------------------------
-
-class RAGChain:
-    def __init__(self, chat_history: List[Dict] | None = None):
-        """
-        chat_history: Streamlit session chat history (list of {role, content})
-        """
-        self.vector_db = VectorDB(embedding_model=EMBEDDING_MODEL)
-        self.chat_history = chat_history or []
-
-        self.llm = ChatOpenAI(
-            model=LLM_MODEL,
-            temperature=LLM_TEMP,
-        )
-
-    # -------------------------------------------------
-    # Retrieval
-    # -------------------------------------------------
-
-    def _retrieve(self, user_input: str, filters: Dict, k: int = 5):
-        retriever = self.vector_db.as_retriever()
-        return retriever(user_input, filters=filters, k=k)
-
-    # -------------------------------------------------
-    # Prompt construction
-    # -------------------------------------------------
-
-    def _build_retrieved_block(self, retrieved: List[Dict]) -> str:
-        if not retrieved:
-            return "No relevant examples found in the dataset."
-
-        lines = []
-        for i, r in enumerate(retrieved, start=1):
-            md = r.get("metadata", {})
-            lines.append(
-                f"Reference #{i}: "
-                f"Campaign='{md.get('campaign_name','')}', "
-                f"CTR={md.get('ctr','?')}, "
-                f"Caption='{md.get('caption','')}'"
-            )
-        return "\n".join(lines)
-
-    def _build_prompt(self, user_input: str, filters: Dict, retrieved: List[Dict]) -> str:
-        retrieved_block = self._build_retrieved_block(retrieved)
-
-        return f"""
-User Question:
-{user_input}
-
-Applied Filters:
-{filters}
-
-Retrieved Dataset Examples:
-{retrieved_block}
-
-Task:
-Using ONLY the retrieved examples above:
-- Generate insights
-- Suggest ad copy ideas
-- Recommend visuals
-
-Rules:
-- Do NOT hallucinate facts
-- Do NOT invent metrics or audiences
-- If information is missing, say so explicitly
+RAG:
+- Used for pattern reference ONLY
+- Never copied verbatim
 """
 
-    # -------------------------------------------------
-    # Multimodal image blocks
-    # -------------------------------------------------
+from typing import List, Dict, Any
+import re
 
-    # def _build_image_blocks(self, retrieved: List[Dict]) -> List[Dict]:
-    #     blocks = []
-    #     BLOCKED_DOMAINS = ("fbcdn.net", "facebook.com")
+from openai import OpenAI
 
-    #     for r in retrieved:
-    #         img_url = r.get("image_url")
-    #         if not img_url:
-    #             continue
+# ============================================================
+# Config
+# ============================================================
 
-    #         if any(d in img_url for d in BLOCKED_DOMAINS):
-    #             continue  # skip unsafe image URLs
+MODEL_NAME = "gpt-4.1-mini"
+TEMPERATURE = 0.9
+MAX_TOKENS = 220
 
-    #         blocks.append({
-    #             "type": "image_url",
-    #             "image_url": {"url": img_url}
-    #         })
+FORBIDDEN_IN_AD = [
+    "dataset",
+    "data shows",
+    "retrieved",
+    "historical ads",
+    "campaign",
+    "based on",
+    "according to",
+]
 
-    #     return blocks
-    def _build_image_blocks(self, retrieved: List[Dict]) -> List[Dict]:
-        # Multimodal disabled — image URLs from Meta/IG are not fetchable by OpenAI
-        return []
+REQUIRED_SECTIONS = [
+    "[AD COPY]",
+    "[WHY THIS WORKS",
+]
 
-    # -------------------------------------------------
-    # Main execution
-    # -------------------------------------------------
+# ============================================================
+# Helpers
+# ============================================================
 
-    def run(self, user_input: str, filters: Dict | None = None):
-        """
-        Returns:
-            answer_text (str)
-            retrieved_results (list)
-        """
-        filters = filters or {}
+def _split_sections(text: str) -> Dict[str, str]:
+    """
+    Split model output into ad + explanation sections.
+    """
+    sections = {}
 
-        # 1. Retrieve
-        retrieved = self._retrieve(user_input, filters)
+    ad_match = re.search(
+        r"\[AD COPY\](.*?)(\[WHY THIS WORKS.*?\])",
+        text,
+        re.S | re.I,
+    )
 
-        # 2. Build prompt
-        final_prompt = self._build_prompt(user_input, filters, retrieved)
+    why_match = re.search(
+        r"\[WHY THIS WORKS.*?\](.*)",
+        text,
+        re.S | re.I,
+    )
 
-        # 3. Build multimodal human message
-        image_blocks = self._build_image_blocks(retrieved)
+    if not ad_match or not why_match:
+        raise ValueError("Output format invalid. Required sections missing.")
 
-        human_content = [
-            {"type": "text", "text": final_prompt},
-            *image_blocks
-        ]
+    sections["ad"] = ad_match.group(1).strip()
+    sections["why"] = why_match.group(1).strip()
 
-        messages = [
-            SystemMessage(content=PROMPTS.get("system_guardrails", "")),
-            #HumanMessage(content=human_content)
-            HumanMessage(content=final_prompt)
-        ]
+    return sections
 
-        # 4. Invoke LLM
-        response = self.llm.invoke(messages)
 
-        # 5. Extract text safely
-        answer_text = getattr(response, "content", str(response))
+def _validate_ad_section(ad_text: str) -> None:
+    """
+    Enforce ZERO dataset leakage in ad copy.
+    """
+    lowered = ad_text.lower()
+    for phrase in FORBIDDEN_IN_AD:
+        if phrase in lowered:
+            raise ValueError(f"Forbidden phrase in ad copy: '{phrase}'")
 
-        return answer_text, retrieved
+    if len(ad_text.splitlines()) > 6:
+        raise ValueError("Ad copy too long. Must be short-form.")
+
+
+def _build_system_prompt() -> str:
+    return (
+        "You are a performance copywriter and growth analyst.\n\n"
+        "You must follow this order strictly:\n"
+        "1) Generate a NEW, deployable ad copy\n"
+        "2) Explain which historical ad patterns influenced it\n\n"
+        "Rules:\n"
+        "- Ad copy MUST NOT reference datasets, campaigns, or examples\n"
+        "- Explanation MAY reference historical patterns abstractly\n"
+        "- Never copy historical ads verbatim\n"
+        "- No hedging or uncertainty language\n\n"
+        "Output format MUST be exactly:\n\n"
+        "[AD COPY]\n"
+        "<final ad text>\n\n"
+        "[WHY THIS WORKS (PATTERN REFERENCE)]\n"
+        "- <pattern explanation>\n"
+        "- <pattern explanation>"
+    )
+
+
+def _build_user_prompt(
+    *,
+    business_type: str,
+    product: str,
+    platform: str,
+    language_style: str,
+    rag_context: str,
+) -> str:
+    return (
+        f"Business type: {business_type}\n"
+        f"Product / Offer: {product}\n"
+        f"Platform: {platform}\n"
+        f"Language style: {language_style}\n\n"
+        "Retrieved historical ads (for pattern reference ONLY):\n"
+        f"{rag_context}\n\n"
+        "Generate the output now."
+    )
+
+
+# ============================================================
+# Public API
+# ============================================================
+
+def generate_ad_with_patterns(
+    *,
+    client: OpenAI,
+    rag_docs: List[Dict[str, Any]],
+    business_type: str,
+    product: str,
+    platform: str = "Meta Ads",
+    language_style: str = "Casual Malaysian English",
+) -> Dict[str, str]:
+    """
+    Main generation entry point.
+
+    Returns:
+    {
+        "ad_copy": "...",
+        "pattern_explanation": "..."
+    }
+    """
+
+    # --- Prepare RAG context (pattern signal only) ---
+    rag_chunks = []
+    for d in rag_docs[:5]:
+        text = d.get("text", "")
+        if text:
+            rag_chunks.append(text[:200])
+
+    rag_context = "\n---\n".join(rag_chunks)
+
+    # --- Build prompts ---
+    system_prompt = _build_system_prompt()
+    user_prompt = _build_user_prompt(
+        business_type=business_type,
+        product=product,
+        platform=platform,
+        language_style=language_style,
+        rag_context=rag_context,
+    )
+
+    # --- Call OpenAI ---
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        temperature=TEMPERATURE,
+        max_tokens=MAX_TOKENS,
+    )
+
+    raw_output = response.choices[0].message.content.strip()
+
+    # --- Validate structure ---
+    sections = _split_sections(raw_output)
+
+    _validate_ad_section(sections["ad"])
+
+    return {
+        "ad_copy": sections["ad"],
+        "pattern_explanation": sections["why"],
+    }
