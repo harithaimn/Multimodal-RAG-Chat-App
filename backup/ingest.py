@@ -43,16 +43,6 @@ print("Initializing OpenAI, Pinecone, and S3 clients...")
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 pinecone_client = Pinecone(api_key=os.getenv("PINECONE_API_KEY"))
 
-# AWS S3 client
-s3 = boto3.client(
-    "s3",
-    aws_access_key_id=os.getenv("AWS_ACCESS_KEY"),
-    aws_secret_access_key=os.getenv("AWS_SECRET_KEY"),
-    region_name=os.getenv("AWS_REGION")
-)
-S3_BUCKET = os.getenv("AWS_S3_BUCKET")
-
-
 # ======================================================
 # 3. LOAD DATASET
 # ======================================================
@@ -109,26 +99,8 @@ class AdCreativeRecord(BaseModel):
 # ======================================================
 # 6. S3 UPLOAD HANDLER
 # ======================================================
-def upload_to_s3(local_path: str, ad_id: str) -> Optional[str]:
-    """Uploads local image to S3 and returns public URL."""
-    if not local_path or not os.path.exists(local_path):
-        return None
-
-    file_ext = os.path.splitext(local_path)[1]
-    key = f"ad_creatives/{ad_id}{file_ext}"
-
-    try:
-        s3.upload_file(
-            local_path,
-            S3_BUCKET,
-            key,
-            ExtraArgs={"ACL": "public-read", "ContentType": "image/jpeg"},
-        )
-        url = f"https://{S3_BUCKET}.s3.amazonaws.com/{key}"
-        return url
-    except Exception as e:
-        print(f"❌ S3 upload failed for {local_path}: {e}")
-        return None
+# We are skipping the upload to S3 part in this file.
+# Removed upload_to_s3 function here based on the request.
 
 
 # ======================================================
@@ -221,10 +193,9 @@ for ad in tqdm(dataset, desc="Processing Ads", ncols=100):
     url_from_json = creative.get("image_url") or None
 
     # 1️⃣ Upload to S3 only if needed
-    if url_from_json and url_from_json.startswith("http"):
-        final_image_url = url_from_json
-    else:
-        final_image_url = upload_to_s3(local_img_path, ad.get("id"))
+    # The upload_to_s3 function has been removed from ingest.py as per your request.
+    # We now directly reference the image URL from get_data.py
+    final_image_url = url_from_json if url_from_json and url_from_json.startswith("http") else None
 
     # 2️⃣ Generate caption
     caption = generate_caption(final_image_url) if final_image_url else ""

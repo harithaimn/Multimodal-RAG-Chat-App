@@ -1,52 +1,53 @@
-# ======================================================
-# CONFIGURATION FILE
-# For Multimodal RAG Pipeline (Ingest + Chatbot)
-# ======================================================
+# Core System Configuration
+# Multimodal RAG – Internal Digital Marketing Assistant
 
-# ======================================================
 # 1. LLM CONFIG
-# ======================================================
 llm:
   # Used for general reasoning / chatbot responses
   model_name: "gpt-4o-mini"
   temperature: 0.2
-  # Lower temp = more deterministic for analytics queries
+  max_tokens: 800
 
-# ======================================================
 # 2. EMBEDDING MODEL
-# ======================================================
 embedding_model:
   # Used during ingestion to embed text data into Pinecone
   # (Cheap, high-quality text embeddings)
   model_name: "text-embedding-3-small"
 
-# ======================================================
 # 3. PINECONE CONFIG
-# ======================================================
 pinecone:
   # Vector DB index for ad creative embeddings
   index_name: "meta-ads-rag-multimodal"
+  metric: "cosine"
+  dimension: 1536
 
-# ======================================================
-# 4. MULTIMODAL CONFIG
-# ======================================================
+# 4. MULTIMODAL / CAPTIONING
 multimodal:
   # Model used for visual captioning only (expensive)
   #caption_model: "gpt-4o"
-  caption_temperature: 0.8
+  captioning_enabled: true
+  caption_model: "gpt-4o-mini"
+  caption_temperature: 0.6
+  caption_max_tokesn: 80
 
-# ======================================================
 # 5. GSHEET CONFIG (Optional for tracking / dashboard)
-# ======================================================
 gsheet:
   credentials_file: "config/gsheet_credentials.json"
-  sheet_name: "Marketing Data Pipeline"
-  worksheet_name: "Ads Performance"
+  worksheet_name: "DMRag-DC#3"
 
-# ======================================================
-# 6. OPTIONAL PARAMETERS
-# ======================================================
+# 6. INGESTION WORKFLOW
 workflow:
-  batch_size: 50           # For Pinecone upserts
-  captioning_enabled: true # Set false to skip caption generation
-  s3_enabled: false        # Skip S3 upload/download if not needed
+  batch_size: 50
+  retry_attempts: 2
+  retry_backoff_sec: 1
+  captioning_enabled: false
+
+# 7. FEATURE TOGGLES
+features:
+  use_context_rules: true
+  enable_chat_persistence: true
+
+# 8. SAFETY / DEBUG
+debug:
+  log_level: "INFO"
+  dry_run: false

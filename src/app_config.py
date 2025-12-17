@@ -1,146 +1,64 @@
 # ============================================================
 # src/app_config.py
 # ============================================================
-# Centralized configuration for dropdowns and static selections
-# Used by Streamlit UI to populate dropdowns dynamically
+# Centralized configuration for Streamlit filters
+# Aligned strictly to Supermetrics → GSheet columns
 # ============================================================
 
+# -----------------------------
+# Campaign-level filters
+# -----------------------------
 
-# CAMPAIGN_OBJECTIVES = (
-#     "All",
-#     "App Installs",
-#     "Brand Awareness",
-#     "Conversions",
-#     "Event Responses",
-#     "Lead Generation",
-#     "Link Clicks",
-#     "Messages",
-#     "Page Likes",
-#     "Post Engagement",
-#     "Product Catalog Sales",
-#     "Reach",
-#     "Store Visit",
-#     "Video Views"
-# )
-
-CAMPAIGN_OBJECTIVES = [
+CAMPAIGN_OBJECTIVES = (
+    "All",
     "Awareness",
     "Engagement",
     "Traffic",
     "Conversions",
     "Lead Generation",
-    "Retention",
-    "Brand Loyalty",
-]
-
-
-TARGET_MARKETS = (
-    "All",
-    "T20",
-    "M40",
-    "B40"
 )
 
-AGE_GROUPS = (
+CAMPAIGN_STATUSES = (
     "All",
-    "Gen Z (18-24)",
-    "Millennials (25-39)",
-    "Gen X (40-55)"
+    "Active",
+    "Paused",
+    "Deleted",
 )
 
-# ============================================================
-# 5. PSYCHOGRAPHICS
-# ============================================================
-PSYCHOGRAPHICS = [
-    "health-conscious",
-    "budget-seeker",
-    "premium-taste",
-    "tech-savvy",
-    "family-oriented",
-    "environmentally-aware",
-    "trend-follower",
-    "status-driven",
-]
-
-
-INDUSTRIES = [
-    "F&B",
-    "Beauty",
-    "Finance",
-    "Retail",
-    "Automotive",
-    "Education",
-    "Healthcare",
-    "Technology",
-    "Travel",
-    "Real Estate",
-    "Entertainment",
-    "Fashion",
-]
-
-"""
-INDUSTRIES = (
+AD_STATUSES = (
     "All",
-    "Advertising & Communications",
-    "Agriculture & Forestry/Wildlife",
-    "Automotive",
-    "Beauty & Body Care",
-    "Consumer Services",
-    "Education",
-    "FMCG",
-    "Fashion & Lifestyle",
-    "Finance & Insurance",
-    "Food & Beverages",
-    "Healthcare & Life Sciences",
-    "Information, Tech & Telecommunications",
-    "Interior Design & Construction",
-    "Leisure, Tourism & Travel",
-    "Logistics & Transportation",
-    "Manufacturing & Production",
-    "Media & Entertainment",
-    "NGOs",
-    "Natural Resources & Energy",
-    "Property & Real Estate",
+    "Active",
+    "Paused",
+    "Deleted",
 )
-"""
 
-#
-# AD_FORMATS = (
-#     "All",
-#     "Image",
-#     "Video",
-#     "Carousel"
-# )
 
-COUNTRIES = (
-    "All",
-    "MY",
-    "SG"
-)
+# -----------------------------
+# Output / UI preferences
+# -----------------------------
 
 ADS_RESPONSE_LANGUAGE = (
     "English",
     "Malay",
-    "Mandarin"
+    "Mandarin",
 )
 
 
-
 # ============================================================
-# 10. UTILITY FUNCTION (for Streamlit UI)
+# Utility function (used by Streamlit UI)
 # ============================================================
 
 def get_filter_options():
     """
-    Returns a dictionary of dropdown configurations for Streamlit UI.
-    Useful for dynamically building filter panels or restoring session state.
+    Returns filter dropdown options for Streamlit UI.
+
+    IMPORTANT:
+    - Every filter here must exist in Pinecone metadata
+    - No inferred / hallucinated attributes
     """
     return {
-        "Industry": INDUSTRIES,
-        "Campaign Objective": CAMPAIGN_OBJECTIVES,
-        "Target Market": TARGET_MARKETS,
-        "Language": ADS_RESPONSE_LANGUAGE,
-        "Psychographics": PSYCHOGRAPHICS,
-        #"Platform": PLATFORMS,
-        #"Ad Format": AD_FORMATS,
+        "campaign_objective": CAMPAIGN_OBJECTIVES,
+        "campaign_status": CAMPAIGN_STATUSES,
+        "ad_status": AD_STATUSES,
+        "language": ADS_RESPONSE_LANGUAGE,
     }
